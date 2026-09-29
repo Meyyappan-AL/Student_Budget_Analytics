@@ -1,0 +1,36 @@
+# Runtime dependencies for the Student Budget Analytics pipeline.
+#
+# Install everything with:
+#     pip install -r requirements.txt
+#
+# Pinned to the versions the pipeline was developed and validated against on
+# Python 3.9.
+
+# --- Data pipeline ----------------------------------------------------------
+# Stage 3 reads the raw .xlsx export; stages 3-6 use DataFrames throughout.
+pandas==2.3.1
+numpy==1.26.4
+
+# pandas' Excel engine. Required by read_excel() in src/cleaner.py; without it
+# that call raises ImportError rather than falling back to another format.
+openpyxl==3.1.5
+
+# --- Database (stages 5 and 6) ---------------------------------------------
+# psycopg2 is the PostgreSQL driver. Only src/database.py and the database
+# branches of src/data_loader.py / src/pipeline.py need it: those imports are
+# lazy, so stages 3, 4 and --dry-run all work without it installed.
+#
+# psycopg2-binary ships prebuilt wheels, so no compiler or libpq headers are
+# required. Switch to the source distribution (psycopg2==2.9.12) if you need a
+# build against your own libpq.
+psycopg2-binary==2.9.12
+
+# --- Notebooks (optional) ---------------------------------------------------
+# Only needed to run or re-execute Notebooks/*.ipynb; the pipeline itself is
+# plain scripts and does not import these.
+#
+# jupyter==1.1.1
+# notebook==7.4.7
+# nbformat==5.10.4
+# nbconvert==7.16.6
+# ipykernel==6.30.1

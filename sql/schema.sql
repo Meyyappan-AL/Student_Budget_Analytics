@@ -302,6 +302,18 @@ COMMIT;
 -- =============================================================================
 -- LOADING THE DATA
 -- =============================================================================
+-- The executable version of everything below is src/data_loader.py, which
+-- generates the staging DDL from the CSV header list so the two cannot drift,
+-- and is what Stage 6 actually runs:
+--
+--     python src/pipeline.py --stages 6 --allow-drop
+--     python src/data_loader.py --dry-run      # validate + print the SQL, no server
+--
+-- The example that follows documents the approach for readers working directly
+-- in psql. Note it stages under the *lowercased* headers for brevity; the
+-- loader instead uses the CSV headers verbatim ("Year of Study"), which is
+-- equally valid and avoids a rename step.
+--
 -- total_expenses and savings are GENERATED columns, so the loader must omit
 -- them; PostgreSQL will not accept an explicit value for a GENERATED ALWAYS
 -- column. A staged table plus INSERT ... SELECT keeps the column mapping
