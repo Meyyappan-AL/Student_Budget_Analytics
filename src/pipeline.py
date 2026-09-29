@@ -1,23 +1,36 @@
-"""Stage 6 - End-to-end pipeline runner for Student Budget Analytics.
+"""Stage 7 - End-to-end pipeline runner for Student Budget Analytics.
 
 Drives the whole chain in order, so the stages can be reproduced in one command
-instead of by remembering four script invocations:
+instead of by remembering five script invocations:
 
     Stage 3  clean the raw Google-Forms export      -> cleaned_student_budget.csv
     Stage 4  transform to short display schema      -> transformed_student_budget.csv
+    Stage 7  data quality gate                      -> blocks the load if it fails
     Stage 5  create the PostgreSQL schema           -> table students_budget
     Stage 6  load the CSV into that table           -> 213 rows, verified
 
-Stages 3 and 4 are pure and always runnable. Stages 5 and 6 need a PostgreSQL
-server, so under ``--dry-run`` they report exactly what they would send to the
-database and stop there. That makes the dry run a genuine pre-flight check: it
-validates the CSV against every constraint the schema will enforce and prints
-the generated SQL, without needing a driver or a server.
+The quality gate runs after the pure stages and before anything touches the
+database. Its blocking rule is the point of the stage: a CRITICAL finding raises
+:class:`~data_quality.QualityCheckFailed` and the load never starts, while a
+WARNING is logged as an alert and the load continues. The split matters because
+this dataset has genuine WARNING-level findings - 112 respondents name a UPI app
+without paying by UPI - and a gate that stopped on those would block every run
+of valid data. Choose the policy with ``--quality``:
+
+    off      skip the gate entirely
+    report   default: run it, block on CRITICAL, alert on WARNING
+    verbose  as 'report', plus print every passing check
+    strict   also block on WARNING
+
+Stages 3, 4 and the gate are pure and always runnable. Stages 5 and 6 need a
+PostgreSQL server, so under ``--dry-run`` they report exactly what they would
+send to the database and stop there.
 
 Usage::
 
     python src/pipeline.py --dry-run
-    python src/pipeline.py --stages 3,4
+    python src/pipeline.py --stages 3,4 --quality verbose
+    python src/pipeline.py --quality strict --allow-drop
     python src/pipeline.py --dsn postgresql://user@localhost:5432/student_budget --allow-drop
 """
 
@@ -25,7 +38,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = Path(__file__).resolve().parent
@@ -39,6 +52,7 @@ if str(SRC_DIR) not in sys.path:
 
 import cleaner  # noqa: E402  (path setup must precede these imports)
 import data_loader  # noqa: E402
+import data_quality  # noqa: E402
 import database  # noqa: E402
 import transformer  # noqa: E402
 
@@ -48,6 +62,10 @@ STAGE_DESCRIPTIONS: Dict[int, str] = {
     5: "create the PostgreSQL schema",
     6: "load the CSV into PostgreSQL",
 }
+
+#: Gate policies for ``--quality``. ``off`` skips; the others run the checks and
+#: differ only in what they print and whether WARNING blocks.
+QUALITY_LEVELS: Tuple[str, ...] = ("off", "report", "verbose", "strict")
 
 #: Stage 6 depends on the table created by stage 5. Running it alone against a
 #: database with no table would fail deep inside the load, so the dependency is
@@ -156,6 +174,79 @@ DATABASE_STAGES = (5, 6)
 
 
 # --------------------------------------------------------------------------- #
+# Stage 7: quality gate
+# --------------------------------------------------------------------------- #
+
+
+def run_quality_gate(context: Dict[str, Any]) -> data_quality.QualityReport:
+    """Run the Stage 7 data quality checks and enforce the blocking policy.
+
+    Executes between the pure stages and the first database stage, so a corrupt
+    batch never reaches PostgreSQL. Two distinct outcomes, matching the two
+    behaviours a gate needs:
+
+    * **CRITICAL failure** - re-raises :class:`data_quality.QualityCheckFailed`,
+      which aborts the run before any connection is opened.
+    * **WARNING failure** - logged as an ``ALERT`` and the load proceeds. This
+      dataset has legitimate warnings (112 respondents name a UPI app without
+      paying by UPI), so blocking on them would reject valid data on every run.
+
+    Parameters
+    ----------
+    context:
+        Runner state. Reads ``quality`` (``off``/``report``/``verbose``/``strict``)
+        and ``quality_json``; writes the resulting report to ``quality_report``.
+
+    Returns
+    -------
+    data_quality.QualityReport
+
+    Raises
+    ------
+    data_quality.QualityCheckFailed
+        If a check fails at a severity the current policy treats as blocking.
+    """
+    level = context.get("quality", "report")
+    if level == "off":
+        _report(7, "skipped     : --quality off")
+        return data_quality.QualityReport()
+
+    source = data_quality.resolve_source_path()
+    _report(7, f"source      : {source}")
+
+    report = data_quality.verify_file()
+    context["quality_report"] = report
+
+    _report(7, f"checks      : {len(report.results)} run, "
+               f"{len(report.critical_failures)} critical, "
+               f"{len(report.warning_failures)} warning, "
+               f"{len(report.info_failures)} info")
+    for line in report.render(verbose=(level == "verbose")).splitlines():
+        _report(7, line)
+
+    json_path = context.get("quality_json")
+    if json_path:
+        destination = Path(json_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(report.to_json(), encoding="utf-8")
+        _report(7, f"wrote       : {destination}")
+
+    if report.passed:
+        _report(7, "gate        : PASS - load may proceed")
+    else:
+        for failure in report.critical_failures:
+            print(f"[ALERT ] CRITICAL quality failure: {failure.name}: {failure.message}",
+                  file=sys.stderr)
+        for failure in report.warning_failures:
+            print(f"[ALERT ] WARNING  quality finding: {failure.name}: {failure.message}",
+                  file=sys.stderr)
+
+    # Raises only when a finding is blocking under the current policy.
+    report.raise_if_failed(strict=(level == "strict"))
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # Dry run
 # --------------------------------------------------------------------------- #
 
@@ -166,13 +257,17 @@ def dry_run(stages: Sequence[int]) -> int:
     Returns a process exit code. Non-zero means the dry run found a problem, so
     it can gate a deployment step in CI.
     """
-    context: Dict[str, Any] = {"allow_drop": True, "skip_validation": False}
+    context: Dict[str, Any] = {"allow_drop": True, "skip_validation": False, "quality": "report"}
 
     for stage in stages:
         if stage in DATABASE_STAGES:
             _report(stage, f"would      : {STAGE_DESCRIPTIONS[stage]}")
         else:
             STAGE_RUNNERS[stage](context)
+
+    # The gate runs in a dry run too: it needs no server, and it is the cheapest
+    # possible pre-flight check.
+    run_quality_gate(context)
 
     if any(stage in DATABASE_STAGES for stage in stages):
         _report(5, "would apply sql/schema.sql (drops and recreates students_budget)")
@@ -252,6 +347,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Load without the pre-flight CSV checks (not recommended).",
     )
+    parser.add_argument(
+        "--quality",
+        choices=QUALITY_LEVELS,
+        default="report",
+        help=(
+            "Stage 7 data quality gate. 'off' skips it; 'report' (default) blocks on "
+            "CRITICAL findings and logs WARNINGs as alerts; 'verbose' also prints passing "
+            "checks; 'strict' also blocks on WARNING."
+        ),
+    )
+    parser.add_argument(
+        "--quality-json",
+        type=Path,
+        default=None,
+        help="Write the Stage 7 quality report to this JSON file for auditing.",
+    )
     arguments = parser.parse_args(argv)
 
     try:
@@ -261,10 +372,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     print("[pipeline ] stages     : " + ", ".join(f"{s} ({STAGE_DESCRIPTIONS[s]})" for s in stages))
+    print(f"[pipeline ] quality    : {arguments.quality}")
     print("[pipeline ] dry run    : " + str(arguments.dry_run).lower())
 
     if arguments.dry_run:
-        return dry_run(stages)
+        try:
+            return dry_run(stages)
+        except data_quality.QualityCheckFailed as exc:
+            print(f"[pipeline ] BLOCKED   : {exc}", file=sys.stderr)
+            return 1
 
     needs_database = any(stage in DATABASE_STAGES for stage in stages)
     if needs_database:
@@ -274,11 +390,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "allow_drop": arguments.allow_drop,
         "skip_validation": arguments.skip_validation,
         "schema_path": arguments.schema,
+        "quality": arguments.quality,
+        "quality_json": arguments.quality_json,
     }
 
+    # The gate runs after the pure stages but BEFORE the first database stage, so
+    # a corrupt batch is rejected without a connection ever being opened and
+    # without the table being dropped and recreated.
     if not needs_database:
         for stage in stages:
             STAGE_RUNNERS[stage](context)
+    else:
+        for stage in stages:
+            if stage in DATABASE_STAGES:
+                break
+            STAGE_RUNNERS[stage](context)
+
+    try:
+        run_quality_gate(context)
+    except data_quality.QualityCheckFailed as exc:
+        print(f"[pipeline ] BLOCKED   : {exc}", file=sys.stderr)
+        print("[pipeline ] no database work was attempted", file=sys.stderr)
+        return 1
+
+    if not needs_database:
         print("[pipeline ] done")
         return 0
 
@@ -286,6 +421,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with database.connect(arguments.dsn) as connection:
             context["connection"] = connection
             for stage in stages:
+                if stage not in DATABASE_STAGES:
+                    continue
                 dependency = STAGE_DEPENDENCIES.get(stage)
                 if dependency is not None and dependency not in stages:
                     _report(stage, f"NOTE      : stage {stage} normally follows stage {dependency}; "
