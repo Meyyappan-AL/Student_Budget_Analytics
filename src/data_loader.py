@@ -1,4 +1,4 @@
-"""Stage 6 - Load the transformed dataset into PostgreSQL.
+"""Stage 6 - Load the transformed dataset into PostgreSQL. 
 
 The Stage 4 CSV uses short Title Case headers for presentation (``Food``,
 ``Budget Usage %``, ``Work/Internship``). Those are not valid bare SQL
