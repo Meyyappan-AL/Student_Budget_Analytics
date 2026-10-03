@@ -375,4 +375,4 @@ question is how a confident assistant ends up confidently wrong.
 
 **Quality report shows one WARNING**
 The UPI cross-field warning described above is expected. Use `--quality off` to skip
-the gate, or leave it as `report` to log it without blocking.
+the gate, or leave it as `report` to log it without blocking. 
