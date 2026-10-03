@@ -5,6 +5,7 @@ Runs a set of named, severity-ranked assertions over the transformed dataset
 reason instead of failing halfway through a ``COPY`` with a bare
 ``CheckViolation``.
 
+
 Why severities
 --------------
 The single most important design decision in a quality framework is which
